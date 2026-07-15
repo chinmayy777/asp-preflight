@@ -137,12 +137,143 @@ def create_app(*, bug_price: bool = False, bug_empty: bool = False,
     return wrapped
 
 
+
+class DirectSettleFacilitator:
+    """Verify an x402 payment and settle it directly on-chain — no OKX API keys.
+
+    Recovers the EIP-3009 signature (same crypto as the mock), then submits the
+    signed transferWithAuthorization to the chain via a public RPC, using a
+    relayer EOA that pays gas. Returns (ok, payer_or_reason, tx_hash) with a
+    REAL, explorer-verifiable transaction hash.
+
+    Env (set on the fixture deployment):
+      NETWORK=base-sepolia
+      RELAYER_PRIVATE_KEY=0x...   funds gas + submits tx (throwaway testnet key)
+      RPC_URL=...                 optional; sensible default per network
+    """
+
+    # from constants.py TRANSFER_WITH_AUTHORIZATION_VRS_ABI (SDK-canonical)
+    _TWA_ABI = [{
+        "inputs": [
+            {"name": "from", "type": "address"},
+            {"name": "to", "type": "address"},
+            {"name": "value", "type": "uint256"},
+            {"name": "validAfter", "type": "uint256"},
+            {"name": "validBefore", "type": "uint256"},
+            {"name": "nonce", "type": "bytes32"},
+            {"name": "v", "type": "uint8"},
+            {"name": "r", "type": "bytes32"},
+            {"name": "s", "type": "bytes32"},
+        ],
+        "name": "transferWithAuthorization",
+        "outputs": [], "stateMutability": "nonpayable", "type": "function",
+    }]
+
+    _DEFAULT_RPC = {
+        "base-sepolia": "https://base-sepolia-rpc.publicnode.com",
+        "eip155:84532": "https://base-sepolia-rpc.publicnode.com",
+    }
+
+    def __init__(self, network: str, relayer_key: str,
+                 usdc_address: str, chain_id: int, rpc_url: str | None = None) -> None:
+        from web3 import Web3
+        rpc = rpc_url or self._DEFAULT_RPC.get(network)
+        if not rpc:
+            raise ValueError(f"no RPC configured for network {network!r}")
+        if not relayer_key:
+            raise ValueError("RELAYER_PRIVATE_KEY is required for direct settlement")
+        from eth_account import Account
+        self._w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 20}))
+        self._relayer = Account.from_key(relayer_key)
+        self._chain_id = chain_id
+        self._usdc = Web3.to_checksum_address(usdc_address)
+        self._contract = self._w3.eth.contract(address=self._usdc, abi=self._TWA_ABI)
+        self._used_nonces: set[str] = set()
+        # reuse the mock's verification logic for signature + field checks
+        self._verifier = MockFacilitator()
+
+    def verify(self, header_value: str, req) -> tuple[bool, str, str]:
+        import base64 as b64
+        import json as _json
+
+        # 1. Cryptographic + field verification (offline, exact same as mock path).
+        ok, who_or_reason, _ = self._verifier.verify(header_value, req)
+        if not ok:
+            return False, who_or_reason, ""
+        payer = who_or_reason
+
+        # 2. Settle on-chain: submit the signed authorization.
+        try:
+            payload = _json.loads(b64.b64decode(header_value))
+            inner = payload["payload"]
+            auth = inner["authorization"]
+            sig = inner["signature"]
+            if sig.startswith("0x"):
+                sig = sig[2:]
+            raw = bytes.fromhex(sig)
+            if len(raw) != 65:
+                return False, f"signature must be 65 bytes, got {len(raw)}", ""
+            r = raw[0:32]
+            s = raw[32:64]
+            v = raw[64]
+            if v < 27:
+                v += 27
+            nonce_bytes = bytes.fromhex(auth["nonce"][2:])
+
+            from web3 import Web3
+            fn = self._contract.functions.transferWithAuthorization(
+                Web3.to_checksum_address(auth["from"]),
+                Web3.to_checksum_address(auth["to"]),
+                int(auth["value"]),
+                int(auth["validAfter"]),
+                int(auth["validBefore"]),
+                nonce_bytes, v, r, s,
+            )
+            tx = fn.build_transaction({
+                "from": self._relayer.address,
+                "nonce": self._w3.eth.get_transaction_count(self._relayer.address),
+                "chainId": self._chain_id,
+                # set fees explicitly; some public RPCs lack eth_maxPriorityFeePerGas
+                "maxFeePerGas": self._w3.to_wei(2, "gwei"),
+                "maxPriorityFeePerGas": self._w3.to_wei(1, "gwei"),
+            })
+            # est. gas w/ headroom; publicnode sometimes underestimates 3009
+            try:
+                tx["gas"] = int(self._w3.eth.estimate_gas(tx) * 1.3)
+            except Exception:
+                tx["gas"] = 120_000
+            signed = self._relayer.sign_transaction(tx)
+            tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+            if receipt.status != 1:
+                return False, f"on-chain settlement reverted (tx {tx_hash.hex()})", ""
+            txh = tx_hash.hex()
+            if not txh.startswith("0x"):
+                txh = "0x" + txh
+            ref = f"base-sepolia:{txh}"
+            return True, payer, ref
+        except Exception as e:  # RPC down, out of gas, nonce race, etc.
+            return False, f"settlement error: {type(e).__name__}: {e}", ""
+
+
 def env_app():
     flag = lambda n: os.getenv(n, "0").lower() in {"1", "true", "yes"}
-    fac = OkxFacilitator() if os.getenv("FACILITATOR", "mock") == "okx" else None
+    network = os.getenv("NETWORK", "mock")
+    mode = os.getenv("FACILITATOR", "mock")
+    fac = None
+    if mode == "direct":
+        from preflight.x402kit import KNOWN_NETWORKS
+        net = KNOWN_NETWORKS[network]
+        fac = DirectSettleFacilitator(
+            network=network,
+            relayer_key=os.getenv("RELAYER_PRIVATE_KEY", ""),
+            usdc_address=net["asset"],
+            chain_id=net["chain_id"],
+            rpc_url=os.getenv("RPC_URL") or None,
+        )
     return create_app(
         bug_price=flag("BUG_PRICE"), bug_empty=flag("BUG_EMPTY"),
-        network=os.getenv("NETWORK", "mock"),
+        network=network,
         pay_to=os.getenv("PAY_TO", DEFAULT_PAY_TO),
         facilitator=fac,
         resource=os.getenv("RESOURCE_URL", "http://bazaar.local/mcp/"),
@@ -154,43 +285,3 @@ app = env_app()
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8801")))
-
-
-class OkxFacilitator:
-    """Real verify+settle via OKX's hosted facilitator (async SDK, sync bridge).
-
-    Used when the fixture is deployed with FACILITATOR=okx and a real network
-    (base-sepolia for the cash-free demo). Same .verify() contract as the mock.
-    """
-
-    def __init__(self, base_url: str | None = None) -> None:
-        from x402.http.okx_facilitator_client import (OKXFacilitatorClient,
-                                                      OKXFacilitatorConfig)
-        cfg = OKXFacilitatorConfig(base_url=base_url) if base_url else OKXFacilitatorConfig()
-        self._client = OKXFacilitatorClient(cfg)
-
-    def verify(self, header_value: str, req) -> tuple[bool, str, str]:
-        import asyncio
-        import base64 as b64
-        from x402.schemas.v1 import PaymentPayloadV1
-        try:
-            payload = PaymentPayloadV1.model_validate_json(b64.b64decode(header_value))
-        except Exception as e:
-            return False, f"X-PAYMENT header malformed: {e}", ""
-
-        async def _go():
-            v = await self._client.verify(payload, req)
-            if not getattr(v, "is_valid", False):
-                return False, str(getattr(v, "invalid_reason", "verify failed")), ""
-            s = await self._client.settle(payload, req)
-            if not getattr(s, "success", False):
-                return False, str(getattr(s, "error_reason", "settle failed")), ""
-            tx = getattr(s, "transaction", "") or getattr(s, "tx_hash", "") or ""
-            return True, payload.payload["authorization"]["from"], str(tx)
-
-        try:
-            return asyncio.get_event_loop().run_until_complete(_go())
-        except RuntimeError:
-            return asyncio.run(_go())
-        except Exception as e:  # facilitator unreachable etc.
-            return False, f"facilitator error: {e}", ""

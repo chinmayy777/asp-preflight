@@ -103,6 +103,32 @@ async def report_page(report_id: str) -> HTMLResponse:
     return HTMLResponse(html)
 
 
+@app.get("/api/demo-run")
+async def demo_run(target_url: str, paid_tool: str = "market_pulse",
+                   price_usdt: float = 0.05) -> HTMLResponse:
+    """Browser-triggerable run (GET). Enabled only when DEMO_TRIGGER=1.
+
+    Lets you kick off a real run from the address bar during setup without a
+    local Python env. Disable after the demo by removing the env var.
+    """
+    import os
+    if os.getenv("DEMO_TRIGGER", "0").lower() not in {"1", "true", "yes"}:
+        raise HTTPException(404, "not found")
+    try:
+        report = await run_preflight(target_url, {
+            "paid_tool": paid_tool, "price_usdt": price_usdt,
+            "tools": ["ping", "market_pulse"],
+        })
+    except TargetRejected as e:
+        raise HTTPException(400, str(e))
+    link = f"{settings.base_url}/report/{report.id}"
+    return HTMLResponse(
+        f'<p>Run complete: <b>{report.overall}</b></p>'
+        f'<p>Spend: {report.spend_usdt} USDC · tx refs: {report.tx_refs}</p>'
+        f'<p><a href="{link}">{link}</a></p>'
+    )
+
+
 @app.get("/")
 async def index() -> RedirectResponse:
     return RedirectResponse("/healthz")
