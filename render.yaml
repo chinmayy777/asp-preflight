@@ -1,0 +1,28 @@
+# Free-tier deploy for both services. Works on Render's free web service.
+services:
+  - type: web
+    name: preflight
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: BASE_URL
+        sync: false
+      - key: PAYER_MODE
+        value: mock
+      - key: ALLOW_LOCAL_TARGETS
+        value: "0"
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+  - type: web
+    name: broken-bazaar
+    runtime: docker
+    dockerfilePath: ./Dockerfile.bazaar
+    plan: free
+    envVars:
+      - key: NETWORK
+        value: mock
+      - key: FACILITATOR
+        value: mock
